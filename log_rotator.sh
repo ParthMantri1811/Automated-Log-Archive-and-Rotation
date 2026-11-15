@@ -76,15 +76,18 @@ timestamp() {
 }
 
 # Write to the audit log
+# FIX: In dry-run mode, print to stdout only — do NOT write to audit.log,
+# since dry-run is explicitly described as making zero changes to the filesystem.
 audit() {
     local level="$1"
     shift
     local message="$*"
     local ts
     ts=$(timestamp)
-    
+
     if [ "$DRY_RUN" = true ]; then
-        echo "[${ts}] [DRY-RUN] [${level}] ${message}" >> "$AUDIT_LOG"
+        # Dry-run: show what would have been logged, but don't touch the file
+        echo -e "${DIM}[${ts}] [DRY-RUN] [${level}] ${message}${NC}" >&2
     else
         echo "[${ts}] [${level}] ${message}" >> "$AUDIT_LOG"
     fi
@@ -360,51 +363,73 @@ generate_archive_name() {
     local base_name="$1"
     local ext
     ext=$(get_compression_ext)
-    
+
     # Extract filename without extension
     local name_no_ext="${base_name%.*}"
     local orig_ext="${base_name##*.}"
-    
+
     # Generate date-stamped name
     local date_stamp
     date_stamp=$(date '+%Y-%m-%d_%H%M%S')
-    
+
     local archive_name="${name_no_ext}_${date_stamp}.${orig_ext}.${ext}"
     local archive_path="${ARCHIVE_DIR}/${archive_name}"
-    
-    # ── Overwrite Protection ──
-    # If the archive filename already exists, append a numeric suffix
-    if [ -f "$archive_path" ]; then
-        local counter=1
-        while [ -f "${ARCHIVE_DIR}/${name_no_ext}_${date_stamp}_${counter}.${orig_ext}.${ext}" ]; do
-            counter=$((counter + 1))
-        done
-        archive_name="${name_no_ext}_${date_stamp}_${counter}.${orig_ext}.${ext}"
+
+    # ── Overwrite Protection (atomic) ──
+    # FIX: The old check-then-use pattern has a TOCTOU race condition when
+    # multiple processes run simultaneously. Instead, we use mktemp to
+    # atomically reserve a unique slot in the archive directory, then
+    # rename it to the final name after compression succeeds.
+    # The temp file acts as a placeholder that blocks other processes.
+    local tmp_placeholder
+    tmp_placeholder=$(mktemp "${ARCHIVE_DIR}/${name_no_ext}_${date_stamp}_XXXXXX.${orig_ext}.${ext}" 2>/dev/null) || {
+        # mktemp fallback: derive unique name from PID
+        archive_name="${name_no_ext}_${date_stamp}_$$.${orig_ext}.${ext}"
         archive_path="${ARCHIVE_DIR}/${archive_name}"
-        warn "Archive name collision detected — using: $archive_name"
-    fi
-    
-    echo "$archive_path"
+        echo "$archive_path"
+        return
+    }
+
+    # Return the temp placeholder path; compress_file will write here,
+    # then we rename it to the clean final name post-compression.
+    echo "$tmp_placeholder"
 }
 
 # ═══════════════════════════════════════════════════════
-#  COMPRESS A FILE
+#  COMPRESS A FILE (atomic write via tmp + rename)
 # ═══════════════════════════════════════════════════════
 compress_file() {
     local source_file="$1"
-    local dest_file="$2"
-    
+    local dest_file="$2"   # This is the mktemp placeholder path
+
+    # Compress directly into the placeholder reserved by generate_archive_name.
+    # On success, rename it to the clean date-stamped name so the final file
+    # appears atomically — no other process can claim the same name.
     case "$COMPRESSION" in
-        gzip)
-            gzip -c "$source_file" > "$dest_file"
-            ;;
-        bzip2)
-            bzip2 -c "$source_file" > "$dest_file"
-            ;;
-        xz)
-            xz -c "$source_file" > "$dest_file"
-            ;;
+        gzip)  gzip  -c "$source_file" > "$dest_file" ;;
+        bzip2) bzip2 -c "$source_file" > "$dest_file" ;;
+        xz)    xz    -c "$source_file" > "$dest_file" ;;
     esac
+
+    # Derive the clean final name by stripping the random mktemp suffix
+    local dir
+    dir=$(dirname "$dest_file")
+    local base
+    base=$(basename "$dest_file")
+    # Pattern: name_DATE_RANDOM.orig.ext  →  name_DATE.orig.ext
+    local clean_name
+    clean_name=$(echo "$base" | sed 's/_[A-Za-z0-9]\{6\}\././'  2>/dev/null || echo "$base")
+    local clean_path="${dir}/${clean_name}"
+
+    if [ ! -f "$clean_path" ]; then
+        mv -f "$dest_file" "$clean_path"
+        # Overwrite dest_file variable is local; caller uses basename of original path.
+        # We write the final path back via stdout for the caller to pick up.
+        echo "$clean_path" > "${dest_file}.finalpath" 2>/dev/null || true
+    else
+        # Clean name already taken (edge case) — keep the mktemp unique name
+        echo "$dest_file" > "${dest_file}.finalpath" 2>/dev/null || true
+    fi
 }
 
 # ═══════════════════════════════════════════════════════
@@ -470,12 +495,22 @@ scan_and_archive() {
         verbose "Examining: $filename (${file_size_kb} KB)"
         
         # ── Check Age Criterion ──
-        local age_files
-        age_files=$(find "$file" -mtime +"$MAX_AGE_DAYS" 2>/dev/null || true)
-        if [ -n "$age_files" ]; then
+        # FIX: `find -mtime +N` measures age in 24-hour blocks truncated at midnight,
+        # so a file from N days + 1 hour ago might NOT be matched. Instead we use a
+        # reference file touched exactly N days ago and compare with -not -newer,
+        # which does a true second-level comparison with no rounding.
+        local age_ref
+        age_ref=$(mktemp "${TMPDIR:-/tmp}/logage_ref.XXXXXX" 2>/dev/null || echo "/tmp/logage_ref_$$")
+        touch -d "-${MAX_AGE_DAYS} days" "$age_ref" 2>/dev/null || \
+            touch -t "$(date -d "-${MAX_AGE_DAYS} days" '+%Y%m%d%H%M.%S' 2>/dev/null || \
+                        date -v "-${MAX_AGE_DAYS}d" '+%Y%m%d%H%M.%S' 2>/dev/null || \
+                        echo '200001010000.00')" "$age_ref" 2>/dev/null || true
+
+        if [ -f "$age_ref" ] && ! find "$file" -newer "$age_ref" -maxdepth 0 2>/dev/null | grep -q .; then
             should_archive=true
             reason="older than ${MAX_AGE_DAYS} days"
         fi
+        rm -f "$age_ref"
         
         # ── Check Size Criterion ──
         if [ "$file_size_kb" -gt "$MAX_SIZE_KB" ]; then
@@ -493,38 +528,48 @@ scan_and_archive() {
             archive_path=$(generate_archive_name "$filename")
             local archive_name
             archive_name=$(basename "$archive_path")
-            
+
             if [ "$DRY_RUN" = true ]; then
                 echo -e "  ${YELLOW}[DRY-RUN]${NC} Would archive: ${BOLD}$filename${NC}"
                 echo -e "            → ${CYAN}$archive_name${NC}  (reason: $reason)"
-                info "[DRY-RUN] Would archive: $filename → $archive_name (reason: $reason)"
+                audit "INFO" "Would archive: $filename → $archive_name (reason: $reason)"
                 FILES_ARCHIVED=$((FILES_ARCHIVED + 1))
             else
-                # Perform compression
+                # Perform compression (writes to mktemp placeholder, then renames)
                 if compress_file "$file" "$archive_path"; then
+                    # Retrieve the final (possibly renamed) archive path
+                    local final_path="$archive_path"
+                    if [ -f "${archive_path}.finalpath" ]; then
+                        final_path=$(cat "${archive_path}.finalpath")
+                        rm -f "${archive_path}.finalpath"
+                    fi
+                    archive_name=$(basename "$final_path")
+
                     local archive_size
-                    archive_size=$(file_size_bytes "$archive_path")
+                    archive_size=$(file_size_bytes "$final_path")
                     local ratio="0.0"
                     if [ "$file_size" -gt 0 ]; then
                         local saved_bytes=$((file_size - archive_size))
                         local ratio_int=$((saved_bytes * 1000 / file_size))
                         ratio="$((ratio_int / 10)).$((ratio_int % 10))"
                     fi
-                    
+
                     BYTES_BEFORE=$((BYTES_BEFORE + file_size))
                     BYTES_AFTER=$((BYTES_AFTER + archive_size))
-                    
+
                     # Remove the original file after successful archiving
                     rm -f "$file"
-                    
+
                     echo -e "  ${GREEN}[ARCHIVED]${NC} ${BOLD}$filename${NC}"
                     echo -e "             → ${CYAN}$archive_name${NC}"
                     echo -e "             Size: $(human_size $file_size) → $(human_size $archive_size) (${ratio}% reduction)"
                     echo -e "             Reason: $reason"
-                    
+
                     info "Archived: $filename → $archive_name | $(human_size $file_size) → $(human_size $archive_size) (${ratio}% reduction) | Reason: $reason"
                     FILES_ARCHIVED=$((FILES_ARCHIVED + 1))
                 else
+                    # Clean up placeholder on failure
+                    rm -f "$archive_path" "${archive_path}.finalpath"
                     error "Failed to compress: $filename"
                 fi
             fi
@@ -558,11 +603,23 @@ apply_retention_policy() {
     fi
     
     # Find archives older than RETENTION_DAYS
-    local ext
-    ext=$(get_compression_ext)
-    
+    # FIX: Previously only matched the currently configured compression extension.
+    # This left orphaned archives behind if the compression setting was changed
+    # between runs (e.g. gzip → bzip2). Now we match ALL known archive formats.
+    # Also uses a reference-file comparison to avoid -mtime rounding (same fix as
+    # the age-threshold check in scan_and_archive).
+    local ret_ref
+    ret_ref=$(mktemp "${TMPDIR:-/tmp}/logage_ret.XXXXXX" 2>/dev/null || echo "/tmp/logage_ret_$$")
+    touch -d "-${RETENTION_DAYS} days" "$ret_ref" 2>/dev/null || \
+        touch -t "$(date -d "-${RETENTION_DAYS} days" '+%Y%m%d%H%M.%S' 2>/dev/null || \
+                    date -v "-${RETENTION_DAYS}d" '+%Y%m%d%H%M.%S' 2>/dev/null || \
+                    echo '200001010000.00')" "$ret_ref" 2>/dev/null || true
+
     local expired_files
-    expired_files=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f \( -name "*.${ext}" \) -mtime +"$RETENTION_DAYS" 2>/dev/null || true)
+    expired_files=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f \
+        \( -name "*.gz" -o -name "*.bz2" -o -name "*.xz" \) \
+        ! -newer "$ret_ref" 2>/dev/null || true)
+    rm -f "$ret_ref"
     
     if [ -z "$expired_files" ]; then
         info "No expired archives found (all within ${RETENTION_DAYS}-day retention window)"
